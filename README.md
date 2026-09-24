@@ -155,6 +155,9 @@ DeepSeek через Codex CLI. Для задач, созданных вручн�
 ```bash
 /work/deepseek/bin/deepseek --project /work/my-project --model deepseek-flash
 
+# Запуск с моделью Pro:
+/work/deepseek/bin/deepseek --project /work/my-project --model deepseek-v4-pro
+
 # Позже продолжить последний диалог того же проекта:
 /work/deepseek/bin/deepseek resume --project /work/my-project --last
 ```
