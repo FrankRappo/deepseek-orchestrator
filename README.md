@@ -4,8 +4,9 @@
 Responses API. По устройству это отдельный оркестратор, похожий на `/work/glm`:
 DeepSeek может сам составить `tasks/T*.md`, а затем Codex с моделью DeepSeek
 выполнит их по очереди в tmux. Можно также подготовить задачи обычным Codex
-или вручную. У проекта отдельный `CODEX_HOME`, поэтому настройки
-`~/.codex/config.toml` не меняются.
+или вручную. У каждого пользователя отдельный `CODEX_HOME` в
+`~/.local/share/deepseek-codex`, поэтому настройки обычного `~/.codex`
+не меняются и сеансы `root`/`hgff` не конфликтуют.
 
 ## 1. Проверить установку
 
@@ -150,16 +151,23 @@ DeepSeek через Codex CLI. Для задач, созданных вручн�
 Пошаговая инструкция для интерактивной сессии, включая продолжение диалога:
 [`INTERACTIVE_START.txt`](INTERACTIVE_START.txt).
 
+Для короткой команды из любого каталога один раз создайте ссылку в PATH:
+
+```bash
+sudo ln -s /work/deepseek/bin/deepseek /usr/local/bin/deepseek
+```
+
 Для интерактивной работы без очереди:
 
 ```bash
-/work/deepseek/bin/deepseek --project /work/my-project --model deepseek-flash
+deepseek                                    # Pro в текущем каталоге
+deepseek --project /work/my-project --model deepseek-flash
 
 # Запуск с моделью Pro:
-/work/deepseek/bin/deepseek --project /work/my-project --model deepseek-v4-pro
+deepseek --project /work/my-project --model deepseek-v4-pro
 
 # Позже продолжить последний диалог того же проекта:
-/work/deepseek/bin/deepseek resume --project /work/my-project --last
+deepseek resume --project /work/my-project --last
 ```
 
 По умолчанию Codex использует `workspace-write` и запрос подтверждения.

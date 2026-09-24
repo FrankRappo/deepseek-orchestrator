@@ -11,6 +11,12 @@ Codex CLI с моделью DeepSeek. В терминале можно писа�
 
    Нужны установленный Codex CLI версии 0.144.0 или новее, терминал и ключ
    DeepSeek API. Для запуска чата tmux и оркестратор задач не нужны.
+   Однократно установите короткую команду (в этой системе уже установлена):
+
+     sudo ln -s /work/deepseek/bin/deepseek /usr/local/bin/deepseek
+
+   /usr/local/bin есть в PATH у root и hgff. После установки из любого
+   каталога достаточно набрать "deepseek", как обычную команду "codex".
 
    Ключ берётся из переменной DEEPSEEK_API_KEY или из файла
    /home/hgff/api deepseek.txt. Чтобы использовать другой файл, задайте:
@@ -25,18 +31,22 @@ Codex CLI с моделью DeepSeek. В терминале можно писа�
    Не помещайте ключ в репозиторий, команды с ключом или скриншоты.
    Проверка конфигурации (значение ключа не показывается):
 
-     /work/deepseek/bin/deepseek --check
+     deepseek --check
 
 2. Начать новый разговор
+
+   Из текущего каталога, с моделью Pro по умолчанию:
+
+     deepseek
 
    Укажите каталог проекта, с которым агент будет работать. Быстрый вариант
    Flash:
 
-     /work/deepseek/bin/deepseek --project /work/my-project --model deepseek-flash
+     deepseek --project /work/my-project --model deepseek-flash
 
    Вариант Pro:
 
-     /work/deepseek/bin/deepseek --project /work/my-project --model deepseek-v4-pro
+     deepseek --project /work/my-project --model deepseek-v4-pro
 
    Замените /work/my-project на существующий каталог. Если --project не
    указан, используется текущий каталог терминала. Если --model не указан,
@@ -51,26 +61,30 @@ Codex CLI с моделью DeepSeek. В терминале можно писа�
 
    Из того же каталога проекта:
 
-     /work/deepseek/bin/deepseek resume --project /work/my-project --last
+     deepseek resume --project /work/my-project --last
 
    Без --last откроется список сессий этого проекта:
 
-     /work/deepseek/bin/deepseek resume --project /work/my-project
+     deepseek resume --project /work/my-project
 
    По идентификатору, который Codex показывает при выходе:
 
-     /work/deepseek/bin/deepseek resume --project /work/my-project --session UUID
+     deepseek resume --project /work/my-project --session UUID
 
-   История хранится локально в /work/deepseek/.codex, а не в вашем обычном
-   ~/.codex. Для продолжения нужен тот же установленный каталог или его
-   сохранённые локальные данные. История и ключ не публикуются в Git.
+   Если исходная сессия была на Flash, добавьте при продолжении
+   --model deepseek-flash; иначе по умолчанию выбирается Pro.
+
+   История хранится отдельно для каждого пользователя в
+   ~/.local/share/deepseek-codex, а не в обычном ~/.codex. Поэтому сессии
+   root и hgff не смешиваются; продолжайте разговор под тем же пользователем.
+   История и ключ не публикуются в Git.
 
 4. Разрешения и безопасность
 
    Обычно агент получает workspace-write и запрашивает подтверждение для
    действий, которым оно требуется. Для полного доступа есть --dangerous:
 
-     /work/deepseek/bin/deepseek --project /work/my-project --dangerous
+     deepseek --project /work/my-project --dangerous
 
    Этот флаг отключает sandbox и запросы подтверждения. Используйте его
    только осознанно и только в доверенной среде. Для обычного чата он не нужен.

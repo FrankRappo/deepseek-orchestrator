@@ -2,7 +2,8 @@
 # Isolated Codex home using the official DeepSeek Responses API provider.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 CODEX_BIN="${DEEPSEEK_CODEX_BIN:-codex}"
 KEY_FILE="${DEEPSEEK_KEY_FILE:-/home/hgff/api deepseek.txt}"
 MODEL="deepseek-v4-pro"
@@ -74,7 +75,14 @@ if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
 fi
 [[ "$DEEPSEEK_API_KEY" == sk-* ]] || { echo "DeepSeek API key format is invalid" >&2; exit 2; }
 export DEEPSEEK_API_KEY
-export CODEX_HOME="$ROOT/.codex"
+USER_HOME="$(getent passwd "$(id -u)" | cut -d: -f6 || true)"
+USER_HOME="${USER_HOME:-$HOME}"
+export CODEX_HOME="${DEEPSEEK_CODEX_HOME:-$USER_HOME/.local/share/deepseek-codex}"
+mkdir -p "$CODEX_HOME"
+chmod 700 "$CODEX_HOME"
+if [[ ! -f "$CODEX_HOME/config.toml" ]]; then
+  install -m 600 "$ROOT/.codex/config.toml" "$CODEX_HOME/config.toml"
+fi
 
 if [[ "$MODE" == check ]]; then
   printf 'Codex: %s\n' "$codex_version"

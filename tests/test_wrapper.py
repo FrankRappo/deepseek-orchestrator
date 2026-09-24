@@ -32,6 +32,7 @@ class WrapperTests(unittest.TestCase):
         self.env.pop("DEEPSEEK_API_KEY", None)
         self.env.update(
             DEEPSEEK_CODEX_BIN=str(self.fake),
+            DEEPSEEK_CODEX_HOME=str(self.root / "runtime"),
             DEEPSEEK_KEY_FILE=str(self.key_file),
             ARGS_FILE=str(self.root / "args"),
             HOME_FILE=str(self.root / "home"),
@@ -66,7 +67,8 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual((self.root / "prompt-capture").read_text(), "Check this task.\n")
         self.assertEqual((self.root / "key-capture").read_text(), "sk-test-only\n")
         self.assertEqual((self.root / "home").read_text().strip(),
-                         str(WRAPPER.parent.parent / ".codex"))
+                         str(self.root / "runtime"))
+        self.assertTrue((self.root / "runtime" / "config.toml").is_file())
         self.assertIn("model_catalog_json=", "\n".join(args))
 
     def test_interactive_starts_codex_tui_with_safe_permissions(self):
@@ -81,6 +83,16 @@ class WrapperTests(unittest.TestCase):
         self.assertNotIn("exec", args)
         self.assertNotIn("resume", args)
 
+    def test_symlinked_short_command_finds_repository_config(self):
+        short_command = self.root / "deepseek"
+        short_command.symlink_to(WRAPPER)
+        result = subprocess.run(
+            [str(short_command), "--check"], env=self.env, text=True,
+            capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("DeepSeek configuration:", result.stdout)
+
     def test_resume_last_uses_isolated_home_and_project(self):
         result = self.call_interactive("resume", "--last")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -88,7 +100,7 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(args[-2:], ["resume", "--last"])
         self.assertIn(str(self.root), args)
         self.assertEqual((self.root / "home").read_text().strip(),
-                         str(WRAPPER.parent.parent / ".codex"))
+                         str(self.root / "runtime"))
 
     def test_resume_rejects_conflicting_session_selection(self):
         result = self.call_interactive("resume", "--last", "--session", "123")
