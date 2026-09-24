@@ -1,0 +1,865 @@
+#!/usr/bin/env python3
+"""Small tmux-backed task queue for the DeepSeek worker wrapper."""
+
+from __future__ import annotations
+
+import argparse
+from decimal import Decimal
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import shutil
+import subprocess
+import sys
+import time
+
+
+STATUSES = {"SUCCESS", "FAIL", "BLOCKED", "PARTIAL"}
+MODELS = {"deepseek-flash", "deepseek-v4-pro"}
+MODEL_CHOICES = {*MODELS, "auto"}
+ROUTING_MODES = {"economy", "balanced", "quality"}
+CONTROLLERS = {"deepseek", "codex", "manual"}
+TOKEN_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens")
+ROOT = Path(__file__).resolve().parent
+WORKER = ROOT / "deepseek"
+MODEL_POLICY = ROOT.parent / "model_policy.json"
+
+
+class UserError(Exception):
+    pass
+
+
+def atomic_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def project_path(value: str) -> Path:
+    path = Path(value).expanduser().resolve()
+    if not path.is_dir():
+        raise UserError(f"project directory not found: {path}")
+    return path
+
+
+def regular_file(value: str, description: str) -> Path:
+    path = Path(value).expanduser().resolve()
+    if not path.is_file():
+        raise UserError(f"{description} not found: {path}")
+    return path
+
+
+def session_name(project: Path) -> str:
+    digest = hashlib.sha256(os.fsencode(project)).hexdigest()[:10]
+    return f"deepseek_orch_{digest}"
+
+
+def layout(project: Path) -> dict[str, Path]:
+    result = {
+        "tasks": project / "tasks",
+        "reports": project / "reports",
+        "logs": project / "logs",
+        "orch": project / "orch",
+        "state": project / "state" / "deepseek",
+    }
+    for path in result.values():
+        path.mkdir(parents=True, exist_ok=True)
+    (result["orch"] / "prompts").mkdir(parents=True, exist_ok=True)
+    (result["state"] / "tasks").mkdir(parents=True, exist_ok=True)
+    return result
+
+
+def task_files(project: Path) -> list[Path]:
+    task_dir = project / "tasks"
+    if not task_dir.is_dir():
+        return []
+    tasks: list[Path] = []
+    for path in sorted(task_dir.glob("T*.md"), key=lambda item: item.name):
+        # Task input must physically remain in tasks/; this also rejects symlink escapes.
+        if path.is_file() and path.resolve().parent == task_dir.resolve():
+            tasks.append(path.resolve())
+    return tasks
+
+
+def report_status(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    lines = [line for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+    if not lines:
+        return None
+    prefix = "STATUS: "
+    if lines[-1].startswith(prefix) and lines[-1][len(prefix) :] in STATUSES:
+        return lines[-1][len(prefix) :]
+    return None
+
+
+def load_model_policy() -> dict:
+    try:
+        policy = json.loads(MODEL_POLICY.read_text(encoding="utf-8"))
+        if not isinstance(policy.get("models"), dict) or not isinstance(policy.get("routing"), dict):
+            raise ValueError("missing models or routing")
+        return policy
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        raise UserError(f"invalid model policy: {MODEL_POLICY}") from error
+
+
+def task_selection(task: Path, default: str, routing: str = "economy") -> tuple[str, str]:
+    explicit_model = None
+    complexity = None
+    for line in task.read_text(encoding="utf-8", errors="replace").splitlines():
+        model_match = re.fullmatch(r"\s*Model:\s*([^\s]+)\s*", line, re.IGNORECASE)
+        complexity_match = re.fullmatch(r"\s*Complexity:\s*([^\s]+)\s*", line, re.IGNORECASE)
+        stripped = line.strip().lower()
+        if stripped.startswith("model:") and not model_match:
+            raise UserError(f"malformed Model metadata in {task}: {line.strip()}")
+        if stripped.startswith("complexity:") and not complexity_match:
+            raise UserError(f"malformed Complexity metadata in {task}: {line.strip()}")
+        if model_match and explicit_model is not None:
+            raise UserError(f"duplicate Model metadata in {task}")
+        if complexity_match and complexity is not None:
+            raise UserError(f"duplicate Complexity metadata in {task}")
+        if model_match:
+            explicit_model = model_match.group(1).lower()
+        if complexity_match:
+            complexity = complexity_match.group(1).lower()
+    if explicit_model is not None and explicit_model not in MODEL_CHOICES:
+        raise UserError(f"unsupported Model metadata in {task}: {explicit_model}")
+    if complexity is not None and complexity not in {"low", "medium", "high"}:
+        raise UserError(f"unsupported Complexity metadata in {task}: {complexity}")
+    if routing not in ROUTING_MODES:
+        raise UserError(f"unsupported routing mode: {routing}")
+    if explicit_model in MODELS:
+        return explicit_model, f"task Model: {explicit_model}"
+    if default in MODELS:
+        return default, f"explicit CLI --model {default}"
+    effective_complexity = complexity or "low"
+    selected = load_model_policy()["routing"]["modes"][routing][effective_complexity]
+    source = f"Complexity: {complexity}" if complexity else "missing Complexity (treated as low)"
+    return selected, f"auto/{routing}: {source}"
+
+
+def task_model(task: Path, default: str, routing: str = "economy") -> str:
+    return task_selection(task, default, routing)[0]
+
+
+def token_usage(log: Path) -> dict[str, int] | None:
+    totals = {field: 0 for field in TOKEN_FIELDS}
+    turns = 0
+    last_rollout_usage = None
+    if not log.is_file():
+        return None
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        usage = event.get("usage") if isinstance(event, dict) and event.get("type") == "turn.completed" else None
+        if isinstance(event, dict) and event.get("type") == "event_msg":
+            payload = event.get("payload")
+            if isinstance(payload, dict) and payload.get("type") == "token_count":
+                info = payload.get("info")
+                candidate = info.get("total_token_usage") if isinstance(info, dict) else None
+                if isinstance(candidate, dict):
+                    last_rollout_usage = candidate
+        if not isinstance(usage, dict):
+            continue
+        values: dict[str, int] = {}
+        for field in TOKEN_FIELDS:
+            value = usage.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                break
+            values[field] = value
+        else:
+            for field, value in values.items():
+                totals[field] += value
+            turns += 1
+    if not turns and last_rollout_usage is not None:
+        values = {}
+        for field in TOKEN_FIELDS:
+            value = last_rollout_usage.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                return None
+            values[field] = value
+        totals.update(values)
+        turns = 1
+    if not turns:
+        return None
+    totals["total_tokens"] = totals["input_tokens"] + totals["output_tokens"]
+    totals["turns"] = turns
+    return totals
+
+
+def record_usage(project: Path, task_id: str, model: str, log: Path) -> dict | None:
+    usage = token_usage(log)
+    if usage is None:
+        return None
+    record = {
+        "schema_version": 1,
+        "task_id": task_id,
+        "provider": "deepseek",
+        "model": model,
+        "completed_at": int(time.time()),
+        **usage,
+    }
+    ledger = project / "logs" / "deepseek_usage.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    with ledger.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+        stream.flush()
+        fcntl.flock(stream, fcntl.LOCK_UN)
+    return record
+
+
+def usage_summary(project: Path) -> dict:
+    totals = {field: 0 for field in (*TOKEN_FIELDS, "total_tokens", "turns")}
+    models: dict[str, dict[str, int]] = {}
+    model_costs = {model: {"offpeak": Decimal("0"), "peak": Decimal("0")} for model in MODELS}
+    total_costs = {"offpeak": Decimal("0"), "peak": Decimal("0")}
+    policy = load_model_policy()
+    records = 0
+    ledger = project / "logs" / "deepseek_usage.jsonl"
+    if ledger.is_file():
+        for line in ledger.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            model = record.get("model") if isinstance(record, dict) else None
+            if model not in MODELS:
+                continue
+            values = {}
+            for field in totals:
+                value = record.get(field)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    break
+                values[field] = value
+            else:
+                if values["cached_input_tokens"] > values["input_tokens"]:
+                    continue
+                bucket = models.setdefault(model, {field: 0 for field in totals})
+                for field, value in values.items():
+                    totals[field] += value
+                    bucket[field] += value
+                for period in ("offpeak", "peak"):
+                    rates = policy["models"][model]["pricing"][period]
+                    uncached = values["input_tokens"] - values["cached_input_tokens"]
+                    cost = (
+                        Decimal(values["cached_input_tokens"]) * Decimal(rates["input_cache_hit"])
+                        + Decimal(uncached) * Decimal(rates["input_cache_miss"])
+                        + Decimal(values["output_tokens"]) * Decimal(rates["output"])
+                    ) / Decimal(1_000_000)
+                    model_costs[model][period] += cost
+                    total_costs[period] += cost
+                records += 1
+    estimate = None
+    if records:
+        estimate = {
+            "label": "estimate range at pricing snapshot rates; not actual bill",
+            "currency": "USD",
+            "pricing_snapshot_date": policy["pricing_snapshot"]["date"],
+            "offpeak_usd": format(total_costs["offpeak"], "f"),
+            "peak_usd": format(total_costs["peak"], "f"),
+        }
+        for model, values in models.items():
+            values["estimated_cost_usd"] = {
+                "offpeak": format(model_costs[model]["offpeak"], "f"),
+                "peak": format(model_costs[model]["peak"], "f"),
+            }
+    return {"schema_version": 1, "project": str(project), "records": records,
+            "usage_available": records > 0, "totals": totals if records else None,
+            "estimated_cost_usd": estimate, "models": models}
+
+
+def tmux_has(session: str) -> bool:
+    return subprocess.run(
+        ["tmux", "has-session", "-t", f"={session}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
+
+
+def worker_command(project: Path, model: str, dangerous: bool, prompt: Path, output: Path) -> list[str]:
+    command = [str(WORKER), "exec", "--project", str(project), "--model", model]
+    if dangerous:
+        command.append("--dangerous")
+    command.extend(["--prompt-file", str(prompt), "--output-last-message", str(output)])
+    return command
+
+
+def planning_prompt(project: Path, goal: Path, prompt: Path) -> None:
+    goal_text = goal.read_text(encoding="utf-8", errors="replace")
+    prompt.write_text(
+        "You are the controller for a sequential coding queue. Decompose the goal below into "
+        "small, independently executable tasks. If filesystem tools are available, also write "
+        "them to tasks/T01_<slug>.md, tasks/T02_<slug>.md, and so on. Return only a JSON object "
+        "with this shape: {\"tasks\":[{\"id\":\"T01_slug\",\"content\":\"...\"}]}. "
+        "Each content value must begin with Model: auto and then Complexity: low, medium, or high, "
+        "followed by scope and acceptance criteria. Complexity describes the reasoning difficulty; "
+        "the orchestrator applies its selected routing policy. Do not implement the goal.\n\n"
+        f"Project: {project}\n\nGoal:\n{goal_text}\n",
+        encoding="utf-8",
+    )
+
+
+def materialize_plan(output: Path, project: Path) -> None:
+    text = output.read_text(encoding="utf-8", errors="replace").strip()
+    if text.startswith("```json") and text.endswith("```"):
+        text = text[7:-3].strip()
+    elif text.startswith("```") and text.endswith("```"):
+        text = text[3:-3].strip()
+    try:
+        plan = json.loads(text)
+        entries = plan["tasks"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise UserError(f"DeepSeek controller returned an invalid task plan in {output}") from error
+    if not isinstance(entries, list) or not entries:
+        raise UserError(f"DeepSeek controller returned an empty task plan in {output}")
+    task_dir = project / "tasks"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    seen: set[str] = set()
+    validated: list[tuple[Path, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise UserError(f"DeepSeek controller returned an invalid task entry in {output}")
+        task_id, content = entry.get("id"), entry.get("content")
+        if not isinstance(task_id, str) or not re.fullmatch(r"T[0-9]{2,}_[A-Za-z0-9_-]+", task_id):
+            raise UserError(f"DeepSeek controller returned an unsafe task id in {output}")
+        if task_id in seen or not isinstance(content, str) or not content.strip():
+            raise UserError(f"DeepSeek controller returned an invalid task entry in {output}")
+        seen.add(task_id)
+        destination = task_dir / f"{task_id}.md"
+        if destination.exists():
+            raise UserError(f"refusing to overwrite controller task: {destination}")
+        validated.append((destination, content))
+    for destination, content in validated:
+        destination.write_text(content.rstrip() + "\n", encoding="utf-8")
+
+
+def run_planner(project: Path, goal: Path, model: str, dangerous: bool) -> None:
+    paths = layout(project)
+    prompt = paths["orch"] / "prompts" / "controller.md"
+    output = paths["logs"] / "controller.last.md"
+    log = paths["logs"] / "controller.log"
+    planning_prompt(project, goal, prompt)
+    with log.open("wb") as stream:
+        result = subprocess.run(
+            worker_command(project, model, dangerous, prompt, output),
+            cwd=project,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    record_usage(project, "controller", model, log)
+    if result.returncode:
+        raise UserError(f"DeepSeek controller failed (exit {result.returncode}); see {log}")
+    if not task_files(project):
+        if not output.is_file():
+            raise UserError(f"DeepSeek controller produced no task plan; see {log}")
+        materialize_plan(output, project)
+
+
+def task_prompt(task: Path, report: Path, prompt: Path) -> None:
+    body = task.read_text(encoding="utf-8", errors="replace")
+    prompt.write_text(
+        "Execute this task in the current project. Preserve unrelated changes. "
+        "Do not push, deploy, or run destructive git commands unless the task explicitly requires them. "
+        "Run the task's verification commands and do not claim success without evidence. "
+        f"Write a concise completion report to {report}. "
+        "The report's final non-empty line must be exactly one of: STATUS: SUCCESS, "
+        "STATUS: FAIL, STATUS: BLOCKED, STATUS: PARTIAL.\n\n"
+        f"Task source: {task}\n\n{body}\n\n"
+        f"Mandatory completion contract: write {report} and end it with one exact STATUS line.\n",
+        encoding="utf-8",
+    )
+
+
+def blocked_report(report: Path, task_id: str, returncode: int) -> None:
+    report.write_text(
+        f"# {task_id} worker report\n\n"
+        "The worker exited without creating its required report. "
+        f"Exit code: {returncode}. See the task log for details.\n\n"
+        "STATUS: BLOCKED\n",
+        encoding="utf-8",
+    )
+
+
+def run_task(project: Path, task: Path, model: str, dangerous: bool,
+             selection_reason: str | None = None) -> dict:
+    paths = layout(project)
+    task_id = task.stem
+    report = paths["reports"] / f"report_{task_id}.md"
+    log = paths["logs"] / f"{task_id}.log"
+    output = paths["logs"] / f"{task_id}.last.md"
+    prompt = paths["orch"] / "prompts" / f"{task_id}.md"
+    metadata_path = paths["state"] / "tasks" / f"{task_id}.json"
+    launched = int(time.time())
+    metadata = {
+        "schema_version": 1,
+        "task": str(task),
+        "task_id": task_id,
+        "report": str(report),
+        "log": str(log),
+        "model": model,
+        "model_selection_reason": selection_reason,
+        "dangerous": dangerous,
+        "status": "RUNNING",
+        "launched_at": launched,
+    }
+    atomic_json(metadata_path, metadata)
+    task_prompt(task, report, prompt)
+    with log.open("wb") as stream:
+        try:
+            process = subprocess.Popen(
+                worker_command(project, model, dangerous, prompt, output),
+                cwd=project,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            metadata["worker_pid"] = process.pid
+            atomic_json(metadata_path, metadata)
+            returncode = process.wait()
+        except OSError as error:
+            stream.write(f"failed to start worker: {error}\n".encode())
+            returncode = 127
+    if not report.is_file():
+        blocked_report(report, task_id, returncode)
+    elif returncode and report_status(report) == "SUCCESS":
+        with report.open("a", encoding="utf-8") as stream:
+            stream.write(f"\nWorker process exited with code {returncode}; SUCCESS is invalid.\n\nSTATUS: FAIL\n")
+    status = report_status(report) or "INVALID_REPORT"
+    metadata.update(status=status, returncode=returncode, finished_at=int(time.time()))
+    atomic_json(metadata_path, metadata)
+    record_usage(project, task_id, model, log)
+    return metadata
+
+
+def queue_run(project: Path, controller: str, model: str, routing: str,
+              dangerous: bool, idle_exit: bool) -> int:
+    paths = layout(project)
+    log_path = paths["logs"] / "deepseek_orchestrator.log"
+    lock_file = (paths["state"] / "controller.lock").open("a+")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write("another controller owns the project lock\n")
+        lock_file.close()
+        return 3
+    atomic_json(
+        paths["orch"] / "run.json",
+        {
+            "schema_version": 1,
+            "project": str(project),
+            "controller": controller,
+            "executor": "deepseek",
+            "model": model,
+            "routing": routing,
+            "dangerous": dangerous,
+            "pid": os.getpid(),
+            "started_at": int(time.time()),
+        },
+    )
+    terminal_seen: set[str] = set()
+    with log_path.open("a", encoding="utf-8") as log:
+        while True:
+            pending: list[Path] = []
+            for task in task_files(project):
+                if task.stem in terminal_seen:
+                    continue
+                report = paths["reports"] / f"report_{task.stem}.md"
+                existing = report_status(report)
+                metadata_path = paths["state"] / "tasks" / f"{task.stem}.json"
+                metadata_status = None
+                if metadata_path.is_file():
+                    try:
+                        metadata_status = json.loads(metadata_path.read_text(encoding="utf-8")).get("status")
+                    except (OSError, json.JSONDecodeError):
+                        metadata_status = "INVALID_METADATA"
+                if existing or metadata_status not in (None, "RUNNING"):
+                    log.write(f"skip task={task.stem} status={existing or metadata_status}\n")
+                    terminal_seen.add(task.stem)
+                    continue
+                if metadata_status == "RUNNING":
+                    # A prior controller died mid-worker. Make that attempt terminal; never guess
+                    # that it is safe to execute a partially completed coding task again.
+                    if not report.is_file():
+                        blocked_report(report, task.stem, -1)
+                    stale = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    stale.update(status=report_status(report) or "INVALID_REPORT",
+                                 returncode=None, finished_at=int(time.time()))
+                    atomic_json(metadata_path, stale)
+                    log.write(f"stale task={task.stem} status={stale['status']}\n")
+                    terminal_seen.add(task.stem)
+                    continue
+                pending.append(task)
+            log.flush()
+            for task in pending:
+                try:
+                    selected_model, selection_reason = task_selection(task, model, routing)
+                except UserError as error:
+                    report = paths["reports"] / f"report_{task.stem}.md"
+                    report.write_text(f"# Invalid task metadata\n\n{error}\n\nSTATUS: BLOCKED\n",
+                                      encoding="utf-8")
+                    atomic_json(paths["state"] / "tasks" / f"{task.stem}.json", {
+                        "schema_version": 1, "task": str(task), "task_id": task.stem,
+                        "report": str(report), "status": "BLOCKED", "error": str(error),
+                        "finished_at": int(time.time()),
+                    })
+                    log.write(f"blocked task={task.stem} reason=invalid-model-metadata\n")
+                    log.flush()
+                    terminal_seen.add(task.stem)
+                    continue
+                log.write(f"start task={task.stem} model={selected_model} reason={selection_reason}\n")
+                log.flush()
+                metadata = run_task(project, task, selected_model, dangerous, selection_reason)
+                log.write(f"finish task={task.stem} status={metadata['status']}\n")
+                log.flush()
+                terminal_seen.add(task.stem)
+            if idle_exit:
+                (paths["reports"] / "ALL_DONE").touch()
+                lock_file.close()
+                return 0
+            time.sleep(2)
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    project = project_path(args.project)
+    paths = layout(project)
+    tasks = task_files(project)
+    goal = None
+    if args.controller == "deepseek" and not tasks:
+        if not args.goal:
+            raise UserError("deepseek controller requires --goal FILE when tasks/ is empty")
+        goal = regular_file(args.goal, "goal file")
+    elif args.controller != "deepseek" and not tasks:
+        raise UserError(f"{args.controller} controller requires prepared tasks/T*.md files")
+    elif args.goal:
+        regular_file(args.goal, "goal file")
+    if args.controller_model and (args.controller != "deepseek" or goal is None):
+        raise UserError("--controller-model requires a new DeepSeek plan from --goal")
+    preflight()
+    session = session_name(project)
+    if tmux_has(session):
+        raise UserError(f"already running: {session}")
+    if goal:
+        if args.controller_model:
+            controller_model = args.controller_model
+            controller_selection_reason = f"explicit --controller-model {controller_model}"
+        elif args.model in MODELS:
+            controller_model = args.model
+            controller_selection_reason = f"explicit --model {controller_model}"
+        else:
+            controller_model = "deepseek-flash" if args.routing == "economy" else "deepseek-v4-pro"
+            controller_selection_reason = f"auto planner routing: {args.routing}"
+        run_planner(project, goal, controller_model, args.dangerous)
+        tasks = task_files(project)
+    else:
+        controller_model = None
+        controller_selection_reason = None
+    (paths["reports"] / "ALL_DONE").unlink(missing_ok=True)
+    command = [
+        "tmux", "new-session", "-d", "-s", session, "-c", str(project),
+        sys.executable, str(Path(__file__).resolve()), "_run", "--project", str(project),
+        "--controller", args.controller, "--model", args.model, "--routing", args.routing,
+    ]
+    if args.dangerous:
+        command.append("--dangerous")
+    if args.idle_exit:
+        command.append("--idle-exit")
+    result = subprocess.run(command, check=False)
+    if result.returncode:
+        raise UserError(f"tmux failed to start orchestrator (exit {result.returncode})")
+    atomic_json(
+        paths["orch"] / "launch.json",
+        {
+            "schema_version": 1,
+            "session": session,
+            "project": str(project),
+            "controller": args.controller,
+            "executor": "deepseek",
+            "model": args.model,
+            "routing": args.routing,
+            "controller_model": controller_model,
+            "controller_model_selection_reason": controller_selection_reason,
+            "worker_model_selection_reason": (
+                f"explicit --model {args.model}" if args.model in MODELS
+                else f"task Complexity via {args.routing} routing"
+            ),
+            "dangerous": args.dangerous,
+            "tasks": [task.stem for task in tasks],
+            "launched_at": int(time.time()),
+        },
+    )
+    print(f"Started session={session} controller={args.controller} executor=deepseek project={project}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    project = project_path(args.project)
+    session = session_name(project)
+    print(f"orchestrator: {'RUNNING' if tmux_has(session) else 'STOPPED'} ({session})")
+    launch = project / "orch" / "launch.json"
+    if launch.is_file():
+        print(launch.read_text(encoding="utf-8"), end="")
+    for task in task_files(project):
+        metadata = project / "state" / "deepseek" / "tasks" / f"{task.stem}.json"
+        status = "PENDING"
+        if metadata.is_file():
+            try:
+                status = json.loads(metadata.read_text(encoding="utf-8")).get("status", status)
+            except (OSError, json.JSONDecodeError):
+                status = "INVALID_METADATA"
+        else:
+            status = report_status(project / "reports" / f"report_{task.stem}.md") or status
+        print(f"{task.stem}: {status}")
+    return 0
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    project = project_path(args.project)
+    session = session_name(project)
+    groups = worker_groups(project)
+    for group in groups:
+        try:
+            os.killpg(group, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    subprocess.run(["tmux", "kill-session", "-t", f"={session}"], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if groups:
+        time.sleep(0.2)
+    for group in groups:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    print(f"Stopped {session}")
+    return 0
+
+
+def cmd_attach(args: argparse.Namespace) -> int:
+    project = project_path(args.project)
+    return subprocess.run(["tmux", "attach-session", "-t", f"={session_name(project)}"], check=False).returncode
+
+
+def cmd_usage(args: argparse.Namespace) -> int:
+    project = project_path(args.project)
+    summary = usage_summary(project)
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+    if not summary["usage_available"]:
+        print(f"DeepSeek usage for {project}: unknown (no valid token usage events)")
+        return 0
+    totals = summary["totals"]
+    print(f"DeepSeek usage for {project} ({summary['records']} records)")
+    print(f"total: input={totals['input_tokens']} cached={totals['cached_input_tokens']} "
+          f"output={totals['output_tokens']} tokens={totals['total_tokens']} turns={totals['turns']}")
+    estimate = summary["estimated_cost_usd"]
+    print(f"cost ESTIMATE (snapshot {estimate['pricing_snapshot_date']}, not actual bill): "
+          f"USD {estimate['offpeak_usd']} offpeak .. {estimate['peak_usd']} peak")
+    for model, values in sorted(summary["models"].items()):
+        print(f"{model}: input={values['input_tokens']} cached={values['cached_input_tokens']} "
+              f"output={values['output_tokens']} tokens={values['total_tokens']} turns={values['turns']} "
+              f"cost_estimate_usd={values['estimated_cost_usd']['offpeak']}.."
+              f"{values['estimated_cost_usd']['peak']}")
+    return 0
+
+
+def model_history(project: Path | None) -> dict[str, dict | None]:
+    result = {model: None for model in MODELS}
+    if project is None:
+        return result
+    ledger = project / "logs" / "deepseek_usage.jsonl"
+    totals = {model: {field: 0 for field in (*TOKEN_FIELDS, "total_tokens")} for model in MODELS}
+    counts = {model: 0 for model in MODELS}
+    if ledger.is_file():
+        for line in ledger.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            model = record.get("model") if isinstance(record, dict) else None
+            if model not in MODELS or record.get("task_id") == "controller":
+                continue
+            task_id = record.get("task_id")
+            if not isinstance(task_id, str) or not re.fullmatch(
+                r"T[0-9]{2,}_[A-Za-z0-9_-]+", task_id
+            ) or report_status(
+                project / "reports" / f"report_{task_id}.md"
+            ) != "SUCCESS":
+                continue
+            values = {field: record.get(field) for field in totals[model]}
+            if any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                   for value in values.values()):
+                continue
+            counts[model] += 1
+            for field, value in values.items():
+                totals[model][field] += value
+    for model in MODELS:
+        if counts[model]:
+            result[model] = {
+                "completed_tasks": counts[model],
+                "average_tokens": {
+                    field: format(Decimal(value) / Decimal(counts[model]), "f")
+                    for field, value in totals[model].items()
+                },
+            }
+    return result
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    policy = load_model_policy()
+    project = project_path(args.project) if args.project else None
+    history = model_history(project)
+    output = {
+        "schema_version": 1,
+        "pricing_snapshot": policy["pricing_snapshot"],
+        "routing": policy["routing"],
+        "models": {
+            model: {**details, "historical_usage": history[model]}
+            for model, details in policy["models"].items()
+        },
+    }
+    if args.json:
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return 0
+    snapshot = output["pricing_snapshot"]
+    print(f"DeepSeek models (official pricing snapshot {snapshot['date']}, USD per 1M tokens)")
+    print(f"Peak UTC: {snapshot['peak_utc']['days']}; "
+          f"{', '.join(snapshot['peak_utc']['windows'])}")
+    print(f"Routing: heuristic, default={output['routing']['default']}; quality evidence is conflicting")
+    for model, details in output["models"].items():
+        print(f"\n{model}: {details['quality']}")
+        print(f"  use: {details['recommended_for']}")
+        print(f"  context={details['context_window_tokens']} max_output={details['max_output_tokens']}")
+        for period in ("offpeak", "peak"):
+            rates = details["pricing"][period]
+            print(f"  {period}: hit={rates['input_cache_hit']} miss={rates['input_cache_miss']} "
+                  f"output={rates['output']}")
+        historical = details["historical_usage"]
+        if historical is None:
+            print("  historical average tokens/completed task: unknown")
+        else:
+            average = historical["average_tokens"]
+            print(f"  historical average ({historical['completed_tasks']} tasks): "
+                  f"input={average['input_tokens']} cached={average['cached_input_tokens']} "
+                  f"output={average['output_tokens']} total={average['total_tokens']}")
+    print("\nAuto routing: " + json.dumps(output["routing"]["modes"], sort_keys=True))
+    return 0
+
+
+def preflight() -> None:
+    if not shutil.which("tmux"):
+        raise UserError("tmux is required (run orchestrate doctor)")
+    if not WORKER.is_file() or not os.access(WORKER, os.X_OK):
+        raise UserError(f"worker is missing or not executable: {WORKER}")
+    try:
+        result = subprocess.run([str(WORKER), "--check"], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise UserError("worker preflight could not complete") from error
+    if result.returncode:
+        raise UserError("worker preflight failed (run orchestrate doctor)")
+
+
+def worker_groups(project: Path) -> list[int]:
+    result: list[int] = []
+    metadata_dir = project / "state" / "deepseek" / "tasks"
+    for path in metadata_dir.glob("T*.json") if metadata_dir.is_dir() else ():
+        try:
+            metadata = json.loads(path.read_text(encoding="utf-8"))
+            pid = int(metadata["worker_pid"])
+            if metadata.get("status") != "RUNNING" or pid <= 1 or os.getpgid(pid) != pid:
+                continue
+            if (Path("/proc") / str(pid) / "cwd").resolve() != project:
+                continue
+        except (OSError, ValueError, KeyError, json.JSONDecodeError, ProcessLookupError):
+            continue
+        result.append(pid)
+    return result
+
+
+def cmd_doctor(_: argparse.Namespace) -> int:
+    failures: list[str] = []
+    for command in ("python3", "tmux"):
+        found = shutil.which(command)
+        print(f"{command}: {'OK' if found else 'MISSING'}")
+        if not found:
+            failures.append(command)
+    if not WORKER.is_file() or not os.access(WORKER, os.X_OK):
+        print(f"worker: MISSING ({WORKER})")
+        failures.append("worker")
+    else:
+        try:
+            result = subprocess.run([str(WORKER), "--check"], stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, check=False, timeout=30)
+            preflight_ok = result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            preflight_ok = False
+        print(f"worker preflight: {'OK' if preflight_ok else 'FAILED'}")
+        if not preflight_ok:
+            failures.append("worker preflight")
+    return 1 if failures else 0
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(prog="orchestrate")
+    commands = result.add_subparsers(dest="command", required=True)
+    start = commands.add_parser("start")
+    start.add_argument("--project", required=True)
+    start.add_argument("--controller", choices=sorted(CONTROLLERS), required=True)
+    start.add_argument("--goal")
+    start.add_argument("--dangerous", action="store_true")
+    start.add_argument("--model", choices=sorted(MODEL_CHOICES), default="auto")
+    start.add_argument("--routing", choices=sorted(ROUTING_MODES), default="economy")
+    start.add_argument("--controller-model", choices=sorted(MODELS),
+                       help="model for DeepSeek planning; --model selects workers")
+    start.add_argument("--idle-exit", action="store_true")
+    start.set_defaults(function=cmd_start)
+    for name, function in (("status", cmd_status), ("stop", cmd_stop), ("attach", cmd_attach)):
+        command = commands.add_parser(name)
+        command.add_argument("--project", required=True)
+        command.set_defaults(function=function)
+    usage = commands.add_parser("usage")
+    usage.add_argument("--project", required=True)
+    usage.add_argument("--json", action="store_true")
+    usage.set_defaults(function=cmd_usage)
+    models = commands.add_parser("models")
+    models.add_argument("--project")
+    models.add_argument("--json", action="store_true")
+    models.set_defaults(function=cmd_models)
+    doctor = commands.add_parser("doctor")
+    doctor.set_defaults(function=cmd_doctor)
+    internal = commands.add_parser("_run", help=argparse.SUPPRESS)
+    internal.add_argument("--project", required=True)
+    internal.add_argument("--controller", choices=sorted(CONTROLLERS), required=True)
+    internal.add_argument("--model", choices=sorted(MODEL_CHOICES), required=True)
+    internal.add_argument("--routing", choices=sorted(ROUTING_MODES), required=True)
+    internal.add_argument("--dangerous", action="store_true")
+    internal.add_argument("--idle-exit", action="store_true")
+    internal.set_defaults(function=lambda args: queue_run(project_path(args.project), args.controller,
+                                                          args.model, args.routing, args.dangerous,
+                                                          args.idle_exit))
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        args = parser().parse_args(argv)
+        return args.function(args)
+    except UserError as error:
+        print(f"orchestrate: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

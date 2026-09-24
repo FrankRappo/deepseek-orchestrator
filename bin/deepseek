@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Isolated Codex home using the official DeepSeek Responses API provider.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CODEX_BIN="${DEEPSEEK_CODEX_BIN:-codex}"
+KEY_FILE="${DEEPSEEK_KEY_FILE:-/home/hgff/api deepseek.txt}"
+MODEL="deepseek-v4-pro"
+PROJECT=""
+PROMPT_FILE=""
+OUTPUT_FILE=""
+DANGEROUS=0
+MODE=interactive
+RESUME_LAST=0
+RESUME_SESSION=""
+
+usage() {
+  cat <<'EOF'
+Usage:
+  deepseek [--project DIR] [--model deepseek-v4-pro|deepseek-flash] [--dangerous]
+  deepseek resume [--project DIR] [--last|--session ID]
+                  [--model deepseek-v4-pro|deepseek-flash] [--dangerous]
+  deepseek exec --project DIR --prompt-file FILE --output-last-message FILE
+                [--model deepseek-v4-pro|deepseek-flash] [--dangerous]
+  deepseek --check
+
+The API key is read from DEEPSEEK_API_KEY or DEEPSEEK_KEY_FILE
+(default: /home/hgff/api deepseek.txt). --dangerous disables Codex approvals
+and its sandbox for this invocation.
+EOF
+}
+
+if [[ "${1:-}" == exec ]]; then MODE=exec; shift; fi
+if [[ "${1:-}" == resume ]]; then MODE=resume; shift; fi
+if [[ "${1:-}" == --check ]]; then MODE=check; shift; fi
+
+while (($#)); do
+  case "$1" in
+    --project) PROJECT="${2:?missing project}"; shift 2 ;;
+    --model) MODEL="${2:?missing model}"; shift 2 ;;
+    --prompt-file) PROMPT_FILE="${2:?missing prompt file}"; shift 2 ;;
+    --output-last-message) OUTPUT_FILE="${2:?missing output file}"; shift 2 ;;
+    --last) RESUME_LAST=1; shift ;;
+    --session) RESUME_SESSION="${2:?missing session ID}"; shift 2 ;;
+    --dangerous) DANGEROUS=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if ((RESUME_LAST)) && [[ -n "$RESUME_SESSION" ]]; then
+  echo "Use either --last or --session, not both" >&2; exit 2
+fi
+if [[ "$MODE" != resume ]] && { ((RESUME_LAST)) || [[ -n "$RESUME_SESSION" ]]; }; then
+  echo "--last and --session require resume" >&2; exit 2
+fi
+
+[[ "$MODEL" == deepseek-v4-pro || "$MODEL" == deepseek-flash ]] || {
+  echo "Unsupported model: $MODEL" >&2; exit 2;
+}
+command -v "$CODEX_BIN" >/dev/null 2>&1 || { echo "Codex CLI is missing" >&2; exit 2; }
+[[ -f "$ROOT/.codex/config.toml" && -f "$ROOT/.codex/models.json" ]] || {
+  echo "DeepSeek Codex configuration is incomplete in $ROOT/.codex" >&2; exit 2;
+}
+codex_version="$("$CODEX_BIN" --version 2>/dev/null)"
+if [[ ! "$codex_version" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]] || \
+   (( 10#${BASH_REMATCH[1]} == 0 && 10#${BASH_REMATCH[2]} < 144 )); then
+  echo "Codex CLI 0.144.0 or later is required" >&2; exit 2
+fi
+
+if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
+  [[ -r "$KEY_FILE" ]] || { echo "DeepSeek API key file is not readable: $KEY_FILE" >&2; exit 2; }
+  IFS= read -r DEEPSEEK_API_KEY < "$KEY_FILE" || true
+fi
+[[ "$DEEPSEEK_API_KEY" == sk-* ]] || { echo "DeepSeek API key format is invalid" >&2; exit 2; }
+export DEEPSEEK_API_KEY
+export CODEX_HOME="$ROOT/.codex"
+
+if [[ "$MODE" == check ]]; then
+  printf 'Codex: %s\n' "$codex_version"
+  printf 'DeepSeek configuration: %s\n' "$CODEX_HOME/config.toml"
+  printf 'DeepSeek API key: available (value hidden)\n'
+  exit 0
+fi
+
+if [[ -z "$PROJECT" ]]; then PROJECT="$PWD"; fi
+[[ -d "$PROJECT" ]] || { echo "Project directory does not exist: $PROJECT" >&2; exit 2; }
+PROJECT="$(cd "$PROJECT" && pwd)"
+
+permissions=(--sandbox workspace-write --ask-for-approval on-request)
+if ((DANGEROUS)); then permissions=(--dangerously-bypass-approvals-and-sandbox); fi
+catalog=(-c "model_catalog_json=\"$ROOT/.codex/models.json\"")
+
+if [[ "$MODE" == interactive ]]; then
+  exec "$CODEX_BIN" -C "$PROJECT" -m "$MODEL" "${permissions[@]}" "${catalog[@]}"
+fi
+
+if [[ "$MODE" == resume ]]; then
+  resume_args=()
+  if ((RESUME_LAST)); then resume_args=(--last); fi
+  if [[ -n "$RESUME_SESSION" ]]; then resume_args=("$RESUME_SESSION"); fi
+  exec "$CODEX_BIN" -C "$PROJECT" -m "$MODEL" "${permissions[@]}" "${catalog[@]}" resume "${resume_args[@]}"
+fi
+
+[[ -f "$PROMPT_FILE" ]] || { echo "Prompt file is required" >&2; exit 2; }
+[[ -n "$OUTPUT_FILE" ]] || { echo "Output file is required" >&2; exit 2; }
+mkdir -p "$(dirname "$OUTPUT_FILE")"
+exec "$CODEX_BIN" "${permissions[@]}" "${catalog[@]}" exec -C "$PROJECT" -m "$MODEL" \
+  --skip-git-repo-check --json --output-last-message "$OUTPUT_FILE" - < "$PROMPT_FILE"

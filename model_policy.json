@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "pricing_snapshot": {
+    "date": "2026-09-24",
+    "currency": "USD",
+    "unit": "per_1m_tokens",
+    "source": "DeepSeek official pricing",
+    "source_url": "https://api-docs.deepseek.com/quick_start/pricing/",
+    "peak_utc": {
+      "days": "Monday-Friday, excluding Chinese public holidays",
+      "windows": ["01:00-04:00", "06:00-10:00"]
+    }
+  },
+  "routing": {
+    "default": "economy",
+    "heuristic": true,
+    "quality_evidence": "conflicting",
+    "quality_evidence_urls": [
+      "https://api-docs.deepseek.com/quick_start/agent_integrations/codex/",
+      "https://api-docs.deepseek.com/news/news260910/"
+    ],
+    "note": "The current Codex catalog calls Pro most capable, while DeepSeek's 2026-09-10 V4.1 Flash release reports benchmark results ahead of V4 Pro. Routing tiers are operational heuristics, not an objective quality ranking.",
+    "modes": {
+      "economy": {"low": "deepseek-flash", "medium": "deepseek-flash", "high": "deepseek-flash"},
+      "balanced": {"low": "deepseek-flash", "medium": "deepseek-flash", "high": "deepseek-v4-pro"},
+      "quality": {"low": "deepseek-flash", "medium": "deepseek-v4-pro", "high": "deepseek-v4-pro"}
+    }
+  },
+  "models": {
+    "deepseek-flash": {
+      "quality": "Current fast frontier coding model; DeepSeek reports V4.1 Flash benchmark gains over V4 Pro.",
+      "recommended_for": "Cost-sensitive and routine work; the economy default for every complexity.",
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 393216,
+      "source_url": "https://api-docs.deepseek.com/api/list-models/",
+      "pricing": {
+        "offpeak": {"input_cache_hit": "0.003", "input_cache_miss": "0.15", "output": "0.6"},
+        "peak": {"input_cache_hit": "0.006", "input_cache_miss": "0.3", "output": "1.2"}
+      }
+    },
+    "deepseek-v4-pro": {
+      "quality": "The current Codex catalog labels Pro most capable, but official quality signals conflict with the newer Flash release.",
+      "recommended_for": "Optional balanced or quality routing for tasks marked medium/high complexity.",
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 393216,
+      "source_url": "https://api-docs.deepseek.com/api/list-models/",
+      "pricing": {
+        "offpeak": {"input_cache_hit": "0.022", "input_cache_miss": "0.66", "output": "1.98"},
+        "peak": {"input_cache_hit": "0.044", "input_cache_miss": "1.32", "output": "3.96"}
+      }
+    }
+  }
+}

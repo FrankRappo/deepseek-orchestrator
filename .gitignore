@@ -1,0 +1,14 @@
+# Only public Codex configuration is tracked; sessions and credentials stay local.
+/.codex/*
+!/.codex/config.toml
+!/.codex/models.json
+
+# Generated orchestration data
+/tasks/
+/reports/
+/logs/
+/state/
+/orch/
+/smoke*/
+__pycache__/
+*.py[cod]

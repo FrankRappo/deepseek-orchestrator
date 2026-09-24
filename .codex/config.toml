@@ -1,0 +1,18 @@
+model = "deepseek-v4-pro"
+model_provider = "deepseek"
+preferred_auth_method = "apikey"
+forced_login_method = "api"
+model_reasoning_effort = "high"
+web_search = "disabled"
+
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com/"
+wire_api = "responses"
+env_key = "DEEPSEEK_API_KEY"
+
+[projects."/tmp/deepseek-interactive-check"]
+trust_level = "trusted"
+
+[projects."/work/deepseek/tasks/mts_cli_probe_20260924"]
+trust_level = "trusted"
