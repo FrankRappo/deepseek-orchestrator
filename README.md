@@ -158,14 +158,23 @@ DeepSeek через Codex CLI. Для задач, созданных вручн�
 sudo ln -s /work/deepseek/bin/deepseek /usr/local/bin/deepseek
 ```
 
-Для интерактивной работы без очереди:
+Самые короткие команды для интерактивной работы без очереди:
 
 ```bash
-deepseek                                    # Pro в текущем каталоге
+# Pro по умолчанию в текущем каталоге:
+deepseek
+
+# Flash:
 deepseek --project /work/my-project --model deepseek-flash
 
-# Запуск с моделью Pro:
+# Pro явно:
 deepseek --project /work/my-project --model deepseek-v4-pro
+
+# Pro с полными правами без sandbox и без запросов разрешений:
+deepseek --project /work/my-project --model deepseek-v4-pro --dangerous
+
+# Flash с полными правами без sandbox и без запросов разрешений:
+deepseek --project /work/my-project --model deepseek-flash --dangerous
 
 # Позже продолжить последний диалог того же проекта:
 deepseek resume --project /work/my-project --last
@@ -173,7 +182,7 @@ deepseek resume --project /work/my-project --last
 
 По умолчанию Codex использует `workspace-write` и запрос подтверждения.
 Добавьте `--dangerous` к `deepseek` или `orchestrate start`, когда нужен
-запуск без sandbox и запросов разрешений:
+запуск без sandbox и запросов разрешений. Для очереди задач:
 
 ```bash
 /work/deepseek/bin/orchestrate start \
