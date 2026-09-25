@@ -1,105 +1,193 @@
-ИНТЕРАКТИВНЫЙ ЗАПУСК DEEPSEEK
-===============================
+ЗАПУСК DEEPSEEK FLASH / PRO
+===========================
 
-Это не отдельный чат-сервер: скрипт bin/deepseek запускает интерактивный
-Codex CLI с моделью DeepSeek. В терминале можно писать запросы, получать
-ответы, разрешать действия и продолжать разговор в той же сессии. Интерфейс
-похож на текущую интерактивную работу с Codex, но модель, доступные функции
-и качество ответов могут отличаться.
+Этот файл фиксирует актуальный способ запуска DeepSeek из `/work/deepseek`.
+Старый документ был про интерактивный запуск как отдельный сценарий; сейчас
+основные режимы два: прямой Codex CLI через `bin/deepseek` и очередь задач
+через `bin/orchestrate`.
 
-1. Подготовка (WSL/Ubuntu)
+## 1. Проверка перед запуском
 
-   Нужны установленный Codex CLI версии 0.144.0 или новее, терминал и ключ
-   DeepSeek API. Для запуска чата tmux и оркестратор задач не нужны.
-   Однократно установите короткую команду (в этой системе уже установлена):
+```bash
+cd /work/deepseek
+bin/deepseek --check
+bin/orchestrate doctor
+bin/balance
+```
 
-     sudo ln -s /work/deepseek/bin/deepseek /usr/local/bin/deepseek
+Ключ берется из `DEEPSEEK_API_KEY` или из файла
+`/home/hgff/api deepseek.txt`. Значение ключа нельзя печатать, коммитить или
+вставлять в отчеты.
 
-   /usr/local/bin есть в PATH у root и hgff. После установки из любого
-   каталога достаточно набрать "deepseek", как обычную команду "codex".
+## 2. Прямой интерактивный запуск
 
-   Ключ берётся из переменной DEEPSEEK_API_KEY или из файла
-   /home/hgff/api deepseek.txt. Чтобы использовать другой файл, задайте:
+Flash:
 
-     export DEEPSEEK_KEY_FILE="/путь/к/файлу-с-ключом.txt"
+```bash
+/work/deepseek/bin/deepseek --project /work/my-project --model deepseek-flash
+```
 
-   Либо введите ключ без записи в историю команд:
+Pro:
 
-     read -rsp 'DeepSeek API key: ' DEEPSEEK_API_KEY; echo
-     export DEEPSEEK_API_KEY
+```bash
+/work/deepseek/bin/deepseek --project /work/my-project --model deepseek-v4-pro
+```
 
-   Не помещайте ключ в репозиторий, команды с ключом или скриншоты.
-   Проверка конфигурации (значение ключа не показывается):
+Если `--model` не указан, `bin/deepseek` использует `deepseek-v4-pro`.
+Если `--project` не указан, используется текущий каталог терминала.
 
-     deepseek --check
+Продолжить последний диалог в том же проекте:
 
-2. Начать новый разговор
+```bash
+/work/deepseek/bin/deepseek resume --project /work/my-project --last --model deepseek-flash
+/work/deepseek/bin/deepseek resume --project /work/my-project --last --model deepseek-v4-pro
+```
 
-   Из текущего каталога, с моделью Pro по умолчанию:
+По умолчанию включены `workspace-write` и подтверждения опасных действий.
+Для полного доступа без sandbox и без запросов разрешений добавляется
+`--dangerous`:
 
-     deepseek
+```bash
+/work/deepseek/bin/deepseek --project /work/my-project --model deepseek-v4-pro --dangerous
+```
 
-   Укажите каталог проекта, с которым агент будет работать. Быстрый вариант
-   Flash:
+`--dangerous` является явным флагом конкретного запуска. Он дает широкие права
+этому процессу Codex, поэтому используйте его только для доверенного проекта.
 
-     deepseek --project /work/my-project --model deepseek-flash
+## 3. Очередь задач через orchestrate
 
-   Вариант Pro:
+Проект должен иметь одну из двух форм:
 
-     deepseek --project /work/my-project --model deepseek-v4-pro
+- `GOAL.md`, если DeepSeek должен сам составить задачи;
+- `tasks/T*.md`, если задачи уже подготовлены Codex, человеком или другим
+  процессом.
 
-   Замените /work/my-project на существующий каталог. Если --project не
-   указан, используется текущий каталог терминала. Если --model не указан,
-   используется deepseek-v4-pro.
+### 3.1. DeepSeek сам планирует и выполняет
 
-   После появления приглашения › печатайте задачи обычным языком и нажимайте
-   Enter. При первом запуске Codex может спросить, доверяете ли вы каталогу;
-   подтверждайте только для известного вам проекта. Для выхода введите
-   /exit и нажмите Enter (или используйте Ctrl+C).
+Flash для планировщика и работников:
 
-3. Продолжить предыдущий разговор
+```bash
+cd /work/deepseek
+bin/orchestrate start \
+  --project /work/my-project \
+  --controller deepseek \
+  --goal /work/my-project/GOAL.md \
+  --model deepseek-flash \
+  --routing economy \
+  --idle-exit
+```
 
-   Из того же каталога проекта:
+Pro для планировщика и работников:
 
-     deepseek resume --project /work/my-project --last
+```bash
+cd /work/deepseek
+bin/orchestrate start \
+  --project /work/my-project \
+  --controller deepseek \
+  --goal /work/my-project/GOAL.md \
+  --model deepseek-v4-pro \
+  --routing quality \
+  --idle-exit
+```
 
-   Без --last откроется список сессий этого проекта:
+Смешанный вариант: планировщик Pro, а работники выбираются политикой routing:
 
-     deepseek resume --project /work/my-project
+```bash
+cd /work/deepseek
+bin/orchestrate start \
+  --project /work/my-project \
+  --controller deepseek \
+  --goal /work/my-project/GOAL.md \
+  --controller-model deepseek-v4-pro \
+  --model auto \
+  --routing balanced \
+  --idle-exit
+```
 
-   По идентификатору, который Codex показывает при выходе:
+### 3.2. Задачи уже подготовлены
 
-     deepseek resume --project /work/my-project --session UUID
+Flash для всех задач с `Model: auto`:
 
-   Если исходная сессия была на Flash, добавьте при продолжении
-   --model deepseek-flash; иначе по умолчанию выбирается Pro.
+```bash
+cd /work/deepseek
+bin/orchestrate start \
+  --project /work/my-project \
+  --controller codex \
+  --model deepseek-flash \
+  --idle-exit
+```
 
-   История хранится отдельно для каждого пользователя в
-   ~/.local/share/deepseek-codex, а не в обычном ~/.codex. Поэтому сессии
-   root и hgff не смешиваются; продолжайте разговор под тем же пользователем.
-   История и ключ не публикуются в Git.
+Pro для всех задач с `Model: auto`:
 
-4. Разрешения и безопасность
+```bash
+cd /work/deepseek
+bin/orchestrate start \
+  --project /work/my-project \
+  --controller codex \
+  --model deepseek-v4-pro \
+  --idle-exit
+```
 
-   Обычно агент получает workspace-write и запрашивает подтверждение для
-   действий, которым оно требуется. Для полного доступа есть --dangerous:
+Автовыбор модели по `Complexity:` в задаче:
 
-     deepseek --project /work/my-project --dangerous
+```bash
+cd /work/deepseek
+bin/orchestrate start \
+  --project /work/my-project \
+  --controller codex \
+  --model auto \
+  --routing balanced \
+  --idle-exit
+```
 
-   Этот флаг отключает sandbox и запросы подтверждения. Используйте его
-   только осознанно и только в доверенной среде. Для обычного чата он не нужен.
+Политика routing при `--model auto`:
 
-5. Если запуск не работает
+- `economy`: low/medium/high -> Flash;
+- `balanced`: low/medium -> Flash, high -> Pro;
+- `quality`: low -> Flash, medium/high -> Pro.
 
-   - "Codex CLI is missing": установите Codex CLI и проверьте codex --version.
-   - "key file is not readable": задайте DEEPSEEK_API_KEY или
-     DEEPSEEK_KEY_FILE с верным путём.
-   - "Project directory does not exist": создайте каталог либо исправьте
-     значение --project.
-   - Ошибка доступа к API: проверьте ключ, сеть и баланс DeepSeek командой
-     /work/deepseek/bin/balance. Команда --check проверяет лишь локальную
-     готовность, а не ответ модели.
+Явная строка `Model: deepseek-flash` или `Model: deepseek-v4-pro` внутри
+`tasks/T*.md` имеет приоритет над `--model auto`.
 
-Проверено 24.09.2026: интерактивный deepseek-flash через Codex CLI 0.155.1
-ответил на тестовый запрос в терминале. Для других версий CLI поведение
-интерфейса и команд может немного отличаться.
+Для запуска очереди с широкими правами добавьте `--dangerous`:
+
+```bash
+cd /work/deepseek
+bin/orchestrate start \
+  --project /work/my-project \
+  --controller codex \
+  --model deepseek-v4-pro \
+  --dangerous \
+  --idle-exit
+```
+
+## 4. Мониторинг и остановка
+
+```bash
+cd /work/deepseek
+bin/orchestrate status --project /work/my-project
+bin/orchestrate usage --project /work/my-project
+bin/orchestrate models --project /work/my-project
+bin/orchestrate attach --project /work/my-project
+bin/orchestrate stop --project /work/my-project
+```
+
+`--idle-exit` завершает tmux-сессию после выполнения всей очереди. Без него
+оркестратор остается ждать новые задачи.
+
+После прерванной или упавшей задачи автоматического повтора нет: задача могла
+уже изменить файлы. Исправьте причину и создайте следующую задачу.
+
+## 5. Какой режим выбирать
+
+- Для быстрого анализа, поиска, простых правок и дешевого прогона используйте
+  `deepseek-flash`.
+- Для сложного планирования, многофайловой реализации, спорной диагностики и
+  задач с большим риском ошибки используйте `deepseek-v4-pro`.
+- Для обычной очереди, где в задачах есть `Complexity:`, используйте
+  `--model auto --routing balanced`.
+- Для максимального качества очереди используйте
+  `--model auto --routing quality` или явный `--model deepseek-v4-pro`.
+
+Проверено по текущим wrapper-скриптам `/work/deepseek/bin/deepseek` и
+`/work/deepseek/bin/orchestrate`.
