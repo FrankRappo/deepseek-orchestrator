@@ -51,6 +51,16 @@ Pro:
 /work/deepseek/bin/deepseek --project /work/my-project --model deepseek-v4-pro --dangerous
 ```
 
+Из root shell можно запускать коротко, как `codex`/`glm`; если `--project` не
+указан, проектом будет текущий каталог:
+
+```bash
+sudo -i
+cd /work/my-project
+deepseek --model deepseek-flash --dangerous
+deepseek --model deepseek-v4-pro --dangerous
+```
+
 `--dangerous` является явным флагом конкретного запуска. Он дает широкие права
 этому процессу Codex, поэтому используйте его только для доверенного проекта.
 

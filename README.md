@@ -176,6 +176,12 @@ deepseek --project /work/my-project --model deepseek-v4-pro --dangerous
 # Flash с полными правами без sandbox и без запросов разрешений:
 deepseek --project /work/my-project --model deepseek-flash --dangerous
 
+# То же из root shell, как короткий запуск Codex/GLM; проектом будет текущий каталог:
+sudo -i
+cd /work/my-project
+deepseek --model deepseek-flash --dangerous
+deepseek --model deepseek-v4-pro --dangerous
+
 # Позже продолжить последний диалог того же проекта:
 deepseek resume --project /work/my-project --last
 ```
