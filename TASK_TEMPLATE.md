@@ -11,6 +11,9 @@ Describe one observable result.
 
 - Allowed files:
 - Constraints:
+- VPS target, remote application path and remote artifact/backup paths:
+- Application execution, SQL, tests, dependencies and builds only on that VPS; no local fallback.
+- Standard framework launch with `--dangerous`; no custom restrictive launcher, UID or profile layers. Do not run preliminary access probes when access is already confirmed by the owner.
 
 ## Acceptance
 

@@ -8,20 +8,35 @@ DeepSeek может сам составить `tasks/T*.md`, а затем Codex
 `~/.local/share/deepseek-codex`, поэтому настройки обычного `~/.codex`
 не меняются и сеансы `root`/`hgff` не конфликтуют.
 
-## 1. Проверить установку
+## 1. Штатный запуск: правило владельца от 24.10.2026
 
-В WSL Ubuntu:
+Для разрешённой задачи запускайте обычный фреймворк с `--dangerous`:
 
 ```bash
-cd /work/deepseek
-bin/orchestrate doctor
-bin/balance
+/work/deepseek/bin/orchestrate start \
+  --project /work/my-project \
+  --controller codex \
+  --model deepseek-v4-pro \
+  --dangerous \
+  --idle-exit
 ```
+
+В проекте должны быть подготовлены `tasks/T*.md`. Не добавляйте собственные
+ограничивающие обёртки, отдельных пользователей, профили или sandbox-слои
+для агента. Штатную конфигурацию провайдера использует сам `bin/deepseek`.
+Если владелец сообщил, что доступ готов, предварительные `--check`, `doctor`
+и `balance` не нужны. Диагностируйте конкретную ошибку запуска, когда она есть.
+
+SQL, приложение, тесты, БД, зависимости и сборки выполняются только на
+авторизованном VPS. WSL/Windows остаются управляющим клиентом; локальный стенд
+не является запасным вариантом. Широкий запуск агента не разрешает менять
+production или перезапускать общие сервисы вне границ поставленной задачи.
 
 Нужны Codex CLI версии 0.144.0 или новее, Python 3 и tmux. Ключ читается из
 `DEEPSEEK_API_KEY` либо из `/home/hgff/api deepseek.txt`; он не копируется в
-этот проект. `doctor` проверяет CLI и доступ к ключу, `balance` делает запрос
-к API DeepSeek. Баланс первого запроса запоминается как база 100%.
+этот проект. `doctor` и `balance` остаются отдельными диагностическими командами,
+а не обязательным шагом перед каждой задачей. Баланс первого запроса
+запоминается как база 100%.
 
 ## 2. Модели, качество, токены и цена
 
@@ -96,7 +111,7 @@ bin/balance
   --goal /work/my-project/GOAL.md \
   --controller-model deepseek-v4-pro \
   --model auto --routing economy \
-  --idle-exit
+  --idle-exit --dangerous
 ```
 
 Планировщик запускается, только когда в `tasks/` ещё нет файлов `T*.md`.
@@ -114,7 +129,7 @@ bin/balance
   --project /work/my-project \
   --controller codex \
   --model auto --routing balanced \
-  --idle-exit
+  --idle-exit --dangerous
 ```
 
 `--controller codex` означает, что задачи создал Codex, а выполняет их
@@ -162,13 +177,13 @@ sudo ln -s /work/deepseek/bin/deepseek /usr/local/bin/deepseek
 
 ```bash
 # Pro по умолчанию в текущем каталоге:
-deepseek
+deepseek --dangerous
 
 # Flash:
-deepseek --project /work/my-project --model deepseek-flash
+deepseek --project /work/my-project --model deepseek-flash --dangerous
 
 # Pro явно:
-deepseek --project /work/my-project --model deepseek-v4-pro
+deepseek --project /work/my-project --model deepseek-v4-pro --dangerous
 
 # Pro с полными правами без sandbox и без запросов разрешений:
 deepseek --project /work/my-project --model deepseek-v4-pro --dangerous
@@ -183,12 +198,12 @@ deepseek --model deepseek-flash --dangerous
 deepseek --model deepseek-v4-pro --dangerous
 
 # Позже продолжить последний диалог того же проекта:
-deepseek resume --project /work/my-project --last
+deepseek resume --project /work/my-project --last --dangerous
 ```
 
-По умолчанию Codex использует `workspace-write` и запрос подтверждения.
-Добавьте `--dangerous` к `deepseek` или `orchestrate start`, когда нужен
-запуск без sandbox и запросов разрешений. Для очереди задач:
+По постоянному указанию владельца передавайте `--dangerous` при обычном запуске
+разрешённой задачи. Это штатный запуск без дополнительных ограничивающих слоёв
+и повторных запросов разрешения. Для очереди задач:
 
 ```bash
 /work/deepseek/bin/orchestrate start \

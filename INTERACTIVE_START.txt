@@ -6,14 +6,19 @@
 основные режимы два: прямой Codex CLI через `bin/deepseek` и очередь задач
 через `bin/orchestrate`.
 
-## 1. Проверка перед запуском
+## 1. Правило запуска владельца от 24.10.2026
 
-```bash
-cd /work/deepseek
-bin/deepseek --check
-bin/orchestrate doctor
-bin/balance
-```
+Для разрешённых задач всегда используйте штатный запуск с `--dangerous`.
+Не добавляйте собственные UID, профили, Landlock/bubblewrap/контейнеры или
+ограничивающие launch-hook. Не переопределяйте `DEEPSEEK_CODEX_BIN` и
+`DEEPSEEK_CODEX_HOME`: используйте обычную конфигурацию фреймворка.
+
+Если владелец сообщил, что доступ готов, запускайте задачу без предварительных
+`--check`, `doctor`, `balance` и пробных API-запросов. Эти команды нужны только
+при отдельном запросе диагностики или конкретной ошибке.
+
+Все прикладные тесты, SQL, БД, зависимости, сборки и browser QA — только на
+авторизованном VPS. WSL/Windows — управляющий клиент. Локальные стенды запрещены.
 
 Ключ берется из `DEEPSEEK_API_KEY` или из файла
 `/home/hgff/api deepseek.txt`. Значение ключа нельзя печатать, коммитить или
@@ -24,13 +29,13 @@ bin/balance
 Flash:
 
 ```bash
-/work/deepseek/bin/deepseek --project /work/my-project --model deepseek-flash
+/work/deepseek/bin/deepseek --project /work/my-project --model deepseek-flash --dangerous
 ```
 
 Pro:
 
 ```bash
-/work/deepseek/bin/deepseek --project /work/my-project --model deepseek-v4-pro
+/work/deepseek/bin/deepseek --project /work/my-project --model deepseek-v4-pro --dangerous
 ```
 
 Если `--model` не указан, `bin/deepseek` использует `deepseek-v4-pro`.
@@ -39,13 +44,11 @@ Pro:
 Продолжить последний диалог в том же проекте:
 
 ```bash
-/work/deepseek/bin/deepseek resume --project /work/my-project --last --model deepseek-flash
-/work/deepseek/bin/deepseek resume --project /work/my-project --last --model deepseek-v4-pro
+/work/deepseek/bin/deepseek resume --project /work/my-project --last --model deepseek-flash --dangerous
+/work/deepseek/bin/deepseek resume --project /work/my-project --last --model deepseek-v4-pro --dangerous
 ```
 
-По умолчанию включены `workspace-write` и подтверждения опасных действий.
-Для полного доступа без sandbox и без запросов разрешений добавляется
-`--dangerous`:
+Штатный широкий запуск разрешённой задачи использует `--dangerous`:
 
 ```bash
 /work/deepseek/bin/deepseek --project /work/my-project --model deepseek-v4-pro --dangerous
@@ -61,8 +64,8 @@ deepseek --model deepseek-flash --dangerous
 deepseek --model deepseek-v4-pro --dangerous
 ```
 
-`--dangerous` является явным флагом конкретного запуска. Он дает широкие права
-этому процессу Codex, поэтому используйте его только для доверенного проекта.
+Владелец дал постоянное разрешение на этот режим для поставленных задач.
+Широкие права процесса не меняют границы задачи и ограничения production.
 
 ## 3. Очередь задач через orchestrate
 
@@ -84,7 +87,7 @@ bin/orchestrate start \
   --goal /work/my-project/GOAL.md \
   --model deepseek-flash \
   --routing economy \
-  --idle-exit
+  --idle-exit --dangerous
 ```
 
 Pro для планировщика и работников:
@@ -97,7 +100,7 @@ bin/orchestrate start \
   --goal /work/my-project/GOAL.md \
   --model deepseek-v4-pro \
   --routing quality \
-  --idle-exit
+  --idle-exit --dangerous
 ```
 
 Смешанный вариант: планировщик Pro, а работники выбираются политикой routing:
@@ -111,7 +114,7 @@ bin/orchestrate start \
   --controller-model deepseek-v4-pro \
   --model auto \
   --routing balanced \
-  --idle-exit
+  --idle-exit --dangerous
 ```
 
 ### 3.2. Задачи уже подготовлены
@@ -124,7 +127,7 @@ bin/orchestrate start \
   --project /work/my-project \
   --controller codex \
   --model deepseek-flash \
-  --idle-exit
+  --idle-exit --dangerous
 ```
 
 Pro для всех задач с `Model: auto`:
@@ -135,7 +138,7 @@ bin/orchestrate start \
   --project /work/my-project \
   --controller codex \
   --model deepseek-v4-pro \
-  --idle-exit
+  --idle-exit --dangerous
 ```
 
 Автовыбор модели по `Complexity:` в задаче:
@@ -147,7 +150,7 @@ bin/orchestrate start \
   --controller codex \
   --model auto \
   --routing balanced \
-  --idle-exit
+  --idle-exit --dangerous
 ```
 
 Политика routing при `--model auto`:
