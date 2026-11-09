@@ -4,6 +4,9 @@ preferred_auth_method = "apikey"
 forced_login_method = "api"
 model_reasoning_effort = "high"
 web_search = "disabled"
+model_context_window = 1048576
+model_auto_compact_token_limit = 600000
+tool_output_token_limit = 64000
 
 [model_providers.deepseek]
 name = "DeepSeek"
